@@ -34,69 +34,87 @@ function getWeatherCondition(code: number): string {
 
 const fetchWeather = createStep({
   id: 'fetch-weather',
-  description: 'Fetches weather forecast for a given city',
+  description: 'Fetches weather forecast for a list of cities',
   inputSchema: z.object({
-    city: z.string().describe('The city to get the weather for'),
+    cities: z.array(z.string()).describe('The cities to get the weather for'),
   }),
-  outputSchema: forecastSchema,
+  outputSchema: z.object({
+    forecasts: z.array(forecastSchema),
+  }),
   execute: async ({ inputData }) => {
     if (!inputData) {
       throw new Error('Input data not found');
     }
 
-    const geocodingUrl = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(inputData.city)}&count=1`;
-    const geocodingResponse = await fetch(geocodingUrl);
-    const geocodingData = (await geocodingResponse.json()) as {
-      results: { latitude: number; longitude: number; name: string }[];
-    };
-
-    if (!geocodingData.results?.[0]) {
-      throw new Error(`Location '${inputData.city}' not found`);
+    if (!inputData.cities.length) {
+      throw new Error('At least one city is required');
     }
 
-    const { latitude, longitude, name } = geocodingData.results[0];
+    const forecasts = await Promise.all(
+      inputData.cities.map(async (city) => {
+        const geocodingUrl = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(
+          city,
+        )}&count=1`;
+        const geocodingResponse = await fetch(geocodingUrl);
+        const geocodingData = (await geocodingResponse.json()) as {
+          results?: { latitude: number; longitude: number; name: string }[];
+        };
 
-    const weatherUrl = `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=precipitation,weathercode&timezone=auto,&hourly=precipitation_probability,temperature_2m`;
-    const response = await fetch(weatherUrl);
-    const data = (await response.json()) as {
-      current: {
-        time: string;
-        precipitation: number;
-        weathercode: number;
-      };
-      hourly: {
-        precipitation_probability: number[];
-        temperature_2m: number[];
-      };
-    };
+        if (!geocodingData.results?.[0]) {
+          throw new Error(`Location '${city}' not found`);
+        }
 
-    const forecast = {
-      date: new Date().toISOString(),
-      maxTemp: Math.max(...data.hourly.temperature_2m),
-      minTemp: Math.min(...data.hourly.temperature_2m),
-      condition: getWeatherCondition(data.current.weathercode),
-      precipitationChance: data.hourly.precipitation_probability.reduce(
-        (acc, curr) => Math.max(acc, curr),
-        0,
-      ),
-      location: name,
-    };
+        const { latitude, longitude, name } = geocodingData.results[0];
 
-    return forecast;
+        const weatherUrl = `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=precipitation,weathercode&timezone=auto&hourly=precipitation_probability,temperature_2m`;
+        const response = await fetch(weatherUrl);
+        const data = (await response.json()) as {
+          current: {
+            time: string;
+            precipitation: number;
+            weathercode: number;
+          };
+          hourly: {
+            precipitation_probability: number[];
+            temperature_2m: number[];
+          };
+        };
+
+        return {
+          date: new Date().toISOString(),
+          maxTemp: Math.max(...data.hourly.temperature_2m),
+          minTemp: Math.min(...data.hourly.temperature_2m),
+          condition: getWeatherCondition(data.current.weathercode),
+          precipitationChance: data.hourly.precipitation_probability.reduce(
+            (acc, curr) => Math.max(acc, curr),
+            0,
+          ),
+          location: name,
+        };
+      }),
+    );
+
+    return { forecasts };
   },
 });
 
 const planActivities = createStep({
   id: 'plan-activities',
   description: 'Suggests activities based on weather conditions',
-  inputSchema: forecastSchema,
+  inputSchema: z.object({
+    forecasts: z.array(forecastSchema),
+  }),
   outputSchema: z.object({
     activities: z.string(),
+    plans: z.array(
+      z.object({
+        location: z.string(),
+        activities: z.string(),
+      }),
+    ),
   }),
   execute: async ({ inputData, mastra }) => {
-    const forecast = inputData;
-
-    if (!forecast) {
+    if (!inputData) {
       throw new Error('Forecast data not found');
     }
 
@@ -105,9 +123,13 @@ const planActivities = createStep({
       throw new Error('Weather agent not found');
     }
 
-    const prompt = `Based on the following weather forecast for ${forecast.location}, suggest appropriate activities:
-      ${JSON.stringify(forecast, null, 2)}
-      For each day in the forecast, structure your response exactly as follows:
+    const plans: { location: string; activities: string }[] = [];
+    let combinedActivities = '';
+
+    for (const forecast of inputData.forecasts) {
+      const prompt = `Based on the following weather forecast for ${forecast.location}, suggest appropriate activities:
+${JSON.stringify(forecast, null, 2)}
+For each day in the forecast, structure your response exactly as follows:
 
       📅 [Day, Month Date, Year]
       ═══════════════════════════
@@ -147,33 +169,41 @@ const planActivities = createStep({
 
       Maintain this exact formatting for consistency, using the emoji and section headers as shown.`;
 
-    const response = await agent.stream([
-      {
-        role: 'user',
-        content: prompt,
-      },
-    ]);
+      const response = await agent.stream([
+        {
+          role: 'user',
+          content: prompt,
+        },
+      ]);
 
-    let activitiesText = '';
+      let activitiesText = '';
 
-    for await (const chunk of response.textStream) {
-      process.stdout.write(chunk);
-      activitiesText += chunk;
+      for await (const chunk of response.textStream) {
+        process.stdout.write(chunk);
+        activitiesText += chunk;
+      }
+
+      plans.push({ location: forecast.location, activities: activitiesText });
+      combinedActivities += `\n\n🏙️ ${forecast.location}\n\n${activitiesText}`.trimEnd();
     }
 
-    return {
-      activities: activitiesText,
-    };
+    return { activities: combinedActivities.trim(), plans };
   },
 });
 
 const weatherWorkflow = createWorkflow({
   id: 'weather-workflow',
   inputSchema: z.object({
-    city: z.string().describe('The city to get the weather for'),
+    cities: z.array(z.string()).describe('The cities to get the weather for'),
   }),
   outputSchema: z.object({
     activities: z.string(),
+    plans: z.array(
+      z.object({
+        location: z.string(),
+        activities: z.string(),
+      }),
+    ),
   }),
 })
   .then(fetchWeather)
