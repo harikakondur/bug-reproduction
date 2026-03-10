@@ -1,6 +1,10 @@
 # bug-reproduction
 
-Welcome to your new [Mastra](https://mastra.ai/) project! We're excited to see what you'll build.
+
+
+https://github.com/user-attachments/assets/1d9c5898-c87a-4066-89c3-4b4d1cf76ccf
+
+
 
 ## Getting Started
 
